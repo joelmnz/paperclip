@@ -767,6 +767,63 @@ describe("AgentConfigForm environment selector", () => {
     expect(result.container.querySelector('input[aria-label="Variable name"]')).toBeNull();
   });
 
+  it("edits agent capabilities in identity settings and sends them in the save patch", async () => {
+    const result = await renderForm([], { capabilities: "Reviews pull requests" });
+    roots.push(result.root);
+
+    const textarea = result.container.querySelector<HTMLTextAreaElement>(
+      '[data-config-section="identity"] textarea',
+    );
+    expect(textarea).toBeTruthy();
+    expect(textarea!.value).toBe("Reviews pull requests");
+
+    // An untouched capabilities field produces no dirty state, so no inline
+    // Save button appears and no patch is sent.
+    expect(findButton(result.container, "Save")).toBeFalsy();
+    expect(result.onSave).not.toHaveBeenCalled();
+
+    const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
+    await act(async () => {
+      setter?.call(textarea!, "Reviews pull requests and writes tests");
+      textarea!.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await flushReact();
+    await act(async () => { textarea!.dispatchEvent(new FocusEvent("focusout", { bubbles: true })); });
+    await flushReact();
+
+    const saveButton = findButton(result.container, "Save");
+    expect(saveButton).toBeTruthy();
+    await clickElement(saveButton);
+
+    expect(result.onSave).toHaveBeenCalledWith(
+      expect.objectContaining({ capabilities: "Reviews pull requests and writes tests" }),
+    );
+  });
+
+  it("sends a null capabilities patch when the identity field is cleared", async () => {
+    const result = await renderForm([], { capabilities: "Old capabilities" });
+    roots.push(result.root);
+
+    const textarea = result.container.querySelector<HTMLTextAreaElement>(
+      '[data-config-section="identity"] textarea',
+    );
+    expect(textarea!.value).toBe("Old capabilities");
+
+    const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
+    await act(async () => {
+      setter?.call(textarea!, "");
+      textarea!.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await flushReact();
+    await act(async () => { textarea!.dispatchEvent(new FocusEvent("focusout", { bubbles: true })); });
+    await flushReact();
+
+    await clickElement(findButton(result.container, "Save"));
+    expect(result.onSave).toHaveBeenCalledWith(
+      expect.objectContaining({ capabilities: null }),
+    );
+  });
+
   it("reads and saves Pi thinking effort using the Pi runtime key", async () => {
     const result = await renderForm([], { adapterType: "pi_local", adapterConfig: { model: "openrouter/anthropic/claude-sonnet-4.6", thinking: "high" } });
     roots.push(result.root);
