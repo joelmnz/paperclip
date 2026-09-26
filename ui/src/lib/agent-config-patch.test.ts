@@ -150,6 +150,28 @@ describe("buildAgentUpdatePatch", () => {
     });
   });
 
+  it("carries identity capabilities edits and omits untouched fields", () => {
+    // An identity edit to capabilities flows straight into the patch.
+    const edited = buildAgentUpdatePatch(
+      makeAgent(),
+      makeOverlay({ identity: { capabilities: "Reviews pull requests and writes tests" } }),
+    );
+    expect(edited.capabilities).toBe("Reviews pull requests and writes tests");
+
+    // An untouched capabilities field (agent value null, empty identity
+    // overlay) generates no spurious capabilities entry in the patch.
+    const untouched = buildAgentUpdatePatch(makeAgent(), makeOverlay());
+    expect(untouched).not.toHaveProperty("capabilities");
+
+    // Clearing the field is permitted: the update schema accepts a nullable
+    // capabilities string, so an explicit null clears the stored value.
+    const cleared = buildAgentUpdatePatch(
+      makeAgent(),
+      makeOverlay({ identity: { capabilities: null } }),
+    );
+    expect(cleared.capabilities).toBeNull();
+  });
+
   it("preserves paperclip skill-sync selections when changing adapter types", () => {
     // Desired skills are adapter-agnostic (company-level selections) but are
     // persisted inside the per-adapter config under `paperclipSkillSync`. A

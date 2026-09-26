@@ -575,34 +575,35 @@ describe("OnboardingWizard — which step it lands on", () => {
       return cta as HTMLButtonElement;
     }
 
-    /**
-     * Pick a model source. The connect step arrives with nothing chosen, so its
-     * CTA stays disabled until a tile is pressed — found by `aria-checked`
-     * rather than by label, because this suite mocks the display registry and
-     * the tiles carry whatever it happens to return.
-     */
-    async function pickModelSource() {
-      const tiles = [...document.body.querySelectorAll("button[aria-checked]")];
-      expect(tiles.length, "the connect step should offer a source").toBeGreaterThan(0);
-      await press(tiles[0]!);
-    }
-
     it("hires under the neutral role, with the name the customer typed", async () => {
       // The arc stopped asking for a role, so every onboarding hire is filed
       // as `general` — and the hire guard returns *silently* when the role is
       // missing, which is exactly how removing the picker could have shipped a
       // Connect button that hires nobody. This is the test that catches that.
+      //
+      // This deployment also pins the connect step to the server-configured
+      // OpenCode source: no tile row is offered, and the hire names the first
+      // model the server declared. The mock stands in for a deployment with
+      // `PAPERCLIP_OPENCODE_PROVIDERS` configured.
+      mockAgentsApi.adapterModels.mockResolvedValue([
+        { id: "nine-router/dev-default", label: "nine-router/dev-default" },
+      ]);
       await openOnAgentStep();
       await nameAgent("Ada");
 
       await press(stepCta());
-      await pickModelSource();
+      // The connect step auto-selects the configured OpenCode source — there
+      // is no tile to press — so the CTA goes straight from naming the agent
+      // to hiring.
+      expect(document.body.querySelectorAll("button[aria-checked]")).toHaveLength(0);
+      expect(document.body.textContent).toContain("Using the configured local OpenCode provider");
       await press(stepCta());
 
       expect(mockAgentsApi.hire).toHaveBeenCalled();
       const [, payload] = mockAgentsApi.hire.mock.calls.at(-1)!;
       expect(payload.role).toBe("general");
       expect(payload.name).toBe("Ada");
+      expect(payload.adapterConfig).toEqual(expect.objectContaining({ model: "nine-router/dev-default" }));
     });
 
     it("does not offer a way back behind the step it entered on", async () => {

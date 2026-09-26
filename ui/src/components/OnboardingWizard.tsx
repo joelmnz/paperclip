@@ -108,7 +108,7 @@ import { DEFAULT_CODEX_LOCAL_BYPASS_APPROVALS_AND_SANDBOX } from "@paperclipai/a
 import { DEFAULT_CURSOR_LOCAL_MODEL } from "@paperclipai/adapter-cursor-local";
 import { DEFAULT_GEMINI_LOCAL_MODEL } from "@paperclipai/adapter-gemini-local";
 import { DEFAULT_KIMI_LOCAL_MODEL } from "@paperclipai/adapter-kimi-local";
-import { DEFAULT_OPENCODE_LOCAL_MODEL, isValidOpenCodeModelId } from "@paperclipai/adapter-opencode-local";
+import { isValidOpenCodeModelId } from "@paperclipai/adapter-opencode-local";
 import {
   canGoBackFromOnboardingStep,
   canJumpToOnboardingStep,
@@ -761,8 +761,11 @@ function OnboardingWizardInner({
    */
   const apiKeySecretRef = useRef<{ key: string; companyId: string; envKey: string; binding?: Awaited<ReturnType<typeof storeProviderApiKey>>["binding"]; aiConnection?: AiConnectionBinding } | null>(null);
   const managedSubscriptionRef = useRef<{ companyId: string; binding: AiConnectionBinding } | null>(null);
-  const managedProvider = aiProviderForAdapter(adapterType);
+  // This self-hosted onboarding path uses the OpenCode provider already wired
+  // into the server; do not create an unrelated hosted OpenRouter connection.
+  const managedProvider = adapterType === "opencode_local" ? undefined : aiProviderForAdapter(adapterType);
   function managedBindingForStep(): AiConnectionBinding | undefined {
+    if (adapterType === "opencode_local") return undefined;
     if (credentialMode === "api") return selectedApiKey?.aiConnection ?? (
       !selectedApiKey && apiKeySecretRef.current?.companyId === createdCompanyId && apiKeySecretRef.current.envKey === apiKeyEnvKeyFor(adapterType)
         ? apiKeySecretRef.current.aiConnection : undefined);
@@ -1149,12 +1152,30 @@ function OnboardingWizardInner({
   }, [disabledTypes]);
 
   /**
+   * The sources step 4 actually offers: the recommended row plus OpenCode.
+   *
+   * OpenCode is not marked `recommended` in the display registry, but a
+   * self-hosted instance with `PAPERCLIP_OPENCODE_PROVIDERS` configured has no
+   * other working source — the recommended tiles all assume a vendor sandbox
+   * sign-in. So the row adds its tile explicitly, without promoting anything
+   * else from `moreAdapters` or touching the server-disabled filter.
+   */
+  const connectSources = useMemo(() => {
+    const opencode = moreAdapters.find(
+      (a) => a.type === "opencode_local" && !a.comingSoon,
+    );
+    return opencode && !recommendedAdapters.some((a) => a.type === "opencode_local")
+      ? [...recommendedAdapters, opencode]
+      : recommendedAdapters;
+  }, [recommendedAdapters, moreAdapters]);
+
+  /**
    * A source chosen from the visible row. Read off the row rather than off
    * `adapterType` alone, because a restored draft can name an adapter this step
    * no longer offers — a selection the customer cannot see.
    */
   const sourceSelected =
-    sourcePicked && recommendedAdapters.some((opt) => opt.type === adapterType);
+    sourcePicked && connectSources.some((opt) => opt.type === adapterType);
 
   /**
    * Whether the connect step may advance.
@@ -1173,7 +1194,25 @@ function OnboardingWizardInner({
    * Anything that gates this step belongs in here, so the next one is added
    * once rather than twice.
    */
-  const connectStepReady = sourceSelected && !adapterEnvLoading && !savedKeys.loading;
+  // This self-hosted deployment uses its declared OpenCode models directly;
+  // onboarding does not ask the user to choose a hosted provider or supply a key.
+  useEffect(() => {
+    if (!effectiveOnboardingOpen || step !== 4 || !adapterRegistryLoaded) return;
+    if (!connectSources.some((source) => source.type === "opencode_local")) {
+      // Only when nothing else has claimed the error. This effect re-runs on
+      // every connect-phase transition, and a blind setError would overwrite
+      // the message a failed hire has just put up — the one thing the step
+      // exists to show the customer.
+      if (error === null) setError("OpenCode is unavailable. Enable the local OpenCode adapter on the server.");
+      return;
+    }
+    if (adapterType !== "opencode_local") setAdapterType("opencode_local");
+    if (!sourcePicked) setSourcePicked(true);
+    if (connectPhase === "idle") setConnectPhase("ready");
+  }, [effectiveOnboardingOpen, step, adapterRegistryLoaded, connectSources, adapterType, sourcePicked, connectPhase, error]);
+
+  const connectStepReady = sourceSelected && !adapterEnvLoading &&
+    (adapterType === "opencode_local" ? Boolean(model) && !adapterModelsLoading && !adapterModelsFetching : !savedKeys.loading);
 
   /**
    * Whether this step has a sign-in to do before it can hire.
@@ -1184,7 +1223,7 @@ function OnboardingWizardInner({
    * sandbox, or a local CLI account — Connect verifies credentials before the hire.
    */
   const connectStepNeedsLogin = Boolean(
-    credentialMode !== "api" &&
+    adapterType !== "opencode_local" && credentialMode !== "api" &&
       // Connection-list invalidation can arrive before the login's completion
       // poll. Keep its controller mounted until it reports success; otherwise
       // the saved account replaces the panel and "Connecting" never finishes.
@@ -1226,7 +1265,8 @@ function OnboardingWizardInner({
   const connectProgress = adapterEnvLoading ? "Testing connection…" : loading ? "Connecting…" : null;
   const hasSavedSubscription = Boolean(savedSubscription || savedKeys.storedLogin.data ||
     (credentialMode !== "api" && managedBindingForStep()));
-  const connectHasCard = credentialMode === "api" || connectStepNeedsLogin || connectStepHasNoSandbox || Boolean(connectProgress);
+  const connectHasCard = adapterType !== "opencode_local" &&
+    (credentialMode === "api" || connectStepNeedsLogin || connectStepHasNoSandbox || Boolean(connectProgress));
   const connectCardLive =
     connectHasCard &&
     (connectPhase === "loading" ||
@@ -1384,7 +1424,7 @@ function OnboardingWizardInner({
                 label: "Connect",
                 icon: "arrow",
                 disabled:
-                  !connectStepReady || (credentialMode === "api" && !apiKey.trim() && !selectedApiKey),
+                  !connectStepReady || (adapterType !== "opencode_local" && credentialMode === "api" && !apiKey.trim() && !selectedApiKey),
               }
           : // Nothing is chosen on arrival, and the row is what chooses. Until
             // it has been answered the button has nothing to do.
@@ -1497,10 +1537,7 @@ function OnboardingWizardInner({
     // unofferable, so the question is open again.
     setSourcePicked(false);
     if (next === "codex_local") return;
-    if (next === "opencode_local") {
-      setModel(DEFAULT_OPENCODE_LOCAL_MODEL);
-      return;
-    }
+    if (next === "opencode_local") return;
     if (next === "gemini_local") {
       setModel(DEFAULT_GEMINI_LOCAL_MODEL);
       return;
@@ -1566,6 +1603,14 @@ function OnboardingWizardInner({
     connectingSinceRef.current = null;
     setConnectCredentialStored(false);
   }, [step]);
+
+  // Onboarding takes the first server-declared OpenCode model; model changes can
+  // be made later in agent settings. Never fall back to the built-in OpenAI ID.
+  useEffect(() => {
+    if (step !== 4 || adapterType !== "opencode_local" || !sourcePicked) return;
+    const first = adapterModels?.[0]?.id;
+    if (first && model !== first) setModel(first);
+  }, [step, adapterType, sourcePicked, adapterModels, model]);
 
   const selectedModel = (adapterModels ?? []).find((m) => m.id === model);
   const hasAnthropicApiKeyOverrideCheck =
@@ -1827,9 +1872,7 @@ function OnboardingWizardInner({
             ? model || DEFAULT_KIMI_LOCAL_MODEL
           : adapterType === "cursor"
             ? model || DEFAULT_CURSOR_LOCAL_MODEL
-            : adapterType === "opencode_local"
-              ? model || DEFAULT_OPENCODE_LOCAL_MODEL
-              : model,
+            : model,
       command,
       args,
       url,
@@ -1867,7 +1910,7 @@ function OnboardingWizardInner({
     // present. If storing failed this stays false, and the right outcome is a
     // configuration with no credential — which the hire then blocks on — rather
     // than one that quietly falls back to embedding the value.
-    if (!managedBindingForStep() && credentialMode === "api" && (bindApiKey || selectedApiKey)) {
+    if (adapterType !== "opencode_local" && !managedBindingForStep() && credentialMode === "api" && (bindApiKey || selectedApiKey)) {
       const env =
         typeof config.env === "object" && config.env !== null && !Array.isArray(config.env)
           ? { ...(config.env as Record<string, unknown>) }
@@ -2659,7 +2702,15 @@ function OnboardingWizardInner({
               )}
 
               {/* Step 4: Connect a model — adapter + model + env check (capsule above) */}
-              {step === 4 && (
+              {/* This instance uses the OpenCode harness and model configured on the server. */}
+              {step === 4 && (adapterType === "opencode_local" ? (
+                <motion.div key="step-4" {...stepContentMotion} exit={stepHandoff ? stepContentMotion.exit : undefined} className="space-y-2 text-sm text-muted-foreground">
+                  <p>Using the configured local OpenCode provider ({model || "loading model…"}). Continue to verify it and create your agent.</p>
+                  {adapterModelsError && <p role="alert" className="text-destructive">Could not load OpenCode models. Check the server configuration and reload.</p>}
+                  {!adapterModelsError && !adapterModelsLoading && !adapterModelsFetching && !model &&
+                    <p role="alert" className="text-destructive">No OpenCode model configured. Check PAPERCLIP_ADAPTER_MODELS on the server.</p>}
+                </motion.div>
+              ) : (
                 <motion.div key="step-4" {...stepContentMotion} exit={stepHandoff ? stepContentMotion.exit : undefined} className="space-y-8">
                   <div>
                     {/* Sources come from `recommendedAdapters`, not a list
@@ -2672,7 +2723,7 @@ function OnboardingWizardInner({
                         question, and answering it is what opens the card. */}
                     <ModelSourceTiles
                       label="Model source"
-                      sources={recommendedAdapters.map((opt) => ({
+                      sources={connectSources.map((opt) => ({
                         id: opt.type,
                         label: CONNECT_SOURCE_NAMES[opt.type] ?? opt.label,
                         icon: <ModelSourceMark type={opt.type} Fallback={opt.icon} />,
@@ -2680,7 +2731,7 @@ function OnboardingWizardInner({
                       mode={credentialMode}
                       selectedId={
                         sourcePicked &&
-                        recommendedAdapters.some((opt) => opt.type === adapterType)
+                        connectSources.some((opt) => opt.type === adapterType)
                           ? adapterType
                           : null
                       }
@@ -2691,7 +2742,7 @@ function OnboardingWizardInner({
                         autoConnectStartedRef.current = false;
                         setSourcePicked(true);
                         setAdapterType(id);
-                        if (id === "opencode_local") setModel(DEFAULT_OPENCODE_LOCAL_MODEL);
+                        if (id === "opencode_local") setModel("");
                         else if (id !== "codex_local") setModel("");
                         setConnectPhase("collapsing");
                       }}
@@ -2793,6 +2844,12 @@ function OnboardingWizardInner({
                           }}
                           onSubmit={() => handleConnectStepPrimary()}
                         />}
+                        {adapterType === "opencode_local" && (
+                          <p className="text-xs text-muted-foreground">
+                            Optional. Leave blank if your provider key is already
+                            set in the server environment — it is never overwritten.
+                          </p>
+                        )}
                       </OnboardingLoginCard>
                     ) : connectStepNeedsLogin &&
                       createdCompanyId &&
@@ -2896,11 +2953,13 @@ function OnboardingWizardInner({
                   </motion.div>
 
                   {/* Conditional adapter fields */}
-                  {/* No model picker. Every adapter this step offers resolves
-                      its own default (see buildAdapterConfig), so the picker
-                      asked the customer to choose a model before they had any
-                      way to judge one — and the agent's model is changeable
-                      later, where its work gives the choice meaning. */}
+                  {adapterType === "opencode_local" && sourceSelected &&
+                    !adapterModelsLoading && !adapterModelsFetching &&
+                    !adapterModelsError && (adapterModels ?? []).length === 0 && (
+                      <p role="alert" className="text-xs text-destructive">
+                        No OpenCode models available. Configure PAPERCLIP_ADAPTER_MODELS on the server.
+                      </p>
+                    )}
 
                   {/* Progress is shown above; failed checks remain actionable here. */}
                   {/* Not while the hire is in flight. The probe's result lands
@@ -3053,7 +3112,7 @@ function OnboardingWizardInner({
                     </div>
                   )}
                 </motion.div>
-              )}
+              ))}
               </AnimatePresence>
 
               {/* Step 5: Review — lead is online (shared capsule above) */}

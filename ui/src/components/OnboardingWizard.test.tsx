@@ -2132,13 +2132,16 @@ describe("OnboardingWizard restore-gate (stale localStorage across accounts)", (
       //
       // The tile row is `recommendedAdapters`; the snap's idea of "visible" is
       // recommended *plus* the advanced list. An adapter in the second but not
-      // the first — a saved `opencode_local`, say — therefore satisfies the
+      // the first — a saved `gemini_local`, say — therefore satisfies the
       // snap, which leaves it alone, while the row it is supposed to be chosen
       // in never shows it. Nothing is highlighted, the canvas is shut, and with
       // the gate on `sourcePicked` the CTA was live: one press hires against an
       // adapter the customer has not seen on this screen.
-      mockAdapterRegistry.list = [{ type: "claude_local" }, { type: "opencode_local" }];
-      const { root } = await openStep4({ adapterType: "opencode_local" });
+      // (`opencode_local` cannot stand in for that shape any more: this
+      // deployment pins the connect step to it, so a saved one is always
+      // offered — see the OpenCode test below.)
+      mockAdapterRegistry.list = [{ type: "claude_local" }, { type: "gemini_local" }];
+      const { root } = await openStep4({ adapterType: "gemini_local" });
 
       const tiles = [...document.body.querySelectorAll("button[aria-checked]")];
       expect(
@@ -2153,6 +2156,53 @@ describe("OnboardingWizard restore-gate (stale localStorage across accounts)", (
         cta!.hasAttribute("disabled"),
         "Connect must not hire an adapter the row never offered",
       ).toBe(true);
+
+      await act(async () => root.unmount());
+    });
+
+    it("pins the connect step to the server-configured OpenCode source and hires with its declared model", async () => {
+      // This self-hosted deployment serves onboarding through the OpenCode
+      // provider configured on the server. The step does not offer the hosted
+      // vendor tiles' sign-in flow at all: it auto-selects OpenCode, takes the
+      // first model the server declared, and never creates a hosted provider
+      // connection — the credential lives in the server environment.
+      mockAdapterRegistry.list = [{ type: "claude_local" }, { type: "opencode_local" }];
+      mockAdapterBuild.buildAdapterConfig.mockImplementation(
+        () => ({ model: "nine-router/dev-default" }) as Record<string, unknown>,
+      );
+      mockAgentsApi.adapterModels.mockResolvedValue([
+        { id: "nine-router/dev-default", label: "nine-router/dev-default" },
+        { id: "nine-router/dev-subagent", label: "nine-router/dev-subagent" },
+      ]);
+      const { root } = await openStep4({ adapterType: "claude_local" });
+
+      // No tile row: the step announces the configured provider instead, with
+      // the first server-declared model already taken.
+      expect(document.body.querySelectorAll("button[aria-checked]")).toHaveLength(0);
+      expect(document.body.textContent).toContain(
+        "Using the configured local OpenCode provider (nine-router/dev-default)",
+      );
+      expect(document.body.textContent).not.toContain("OpenCode is unavailable");
+
+      const cta = [...document.body.querySelectorAll("button")].find(
+        (b) => isArcPrimary(b.textContent?.trim() ?? ""),
+      );
+      expect(
+        cta!.hasAttribute("disabled"),
+        "Connect is live once the configured model has loaded",
+      ).toBe(false);
+
+      await act(async () => { cta!.click(); });
+      for (let i = 0; i < 20 && mockAgentsApi.hire.mock.calls.length < 1; i++) {
+        await act(async () => { await new Promise((resolve) => setTimeout(resolve, 25)); });
+      }
+      expect(mockAgentsApi.hire).toHaveBeenCalledTimes(1);
+      const hireArgs = mockAgentsApi.hire.mock.calls.at(-1) as unknown[];
+      expect((hireArgs[1] as { adapterConfig: Record<string, unknown> }).adapterConfig).toEqual(
+        expect.objectContaining({ model: "nine-router/dev-default" }),
+      );
+      // The credential is the server's own, not a hosted connection.
+      expect(managedApi.create).not.toHaveBeenCalled();
 
       await act(async () => root.unmount());
     });

@@ -68,6 +68,7 @@ import {
   CollapsibleSection,
   DraftInput,
   DraftNumberInput,
+  DraftTextarea,
   help,
   adapterLabels,
 } from "./agent-config-primitives";
@@ -1477,6 +1478,14 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
                 onChange={(id) => mark("identity", "reportsTo", id)}
                 excludeAgentIds={[props.agent.id]}
                 chooseLabel="Choose manager…"
+              />
+            </Field>
+            <Field label="Capabilities" hint={help.capabilities}>
+              <DraftTextarea
+                value={String(eff("identity", "capabilities", props.agent.capabilities ?? "") ?? "")}
+                onCommit={(v) => mark("identity", "capabilities", v || null)}
+                placeholder="What this agent can do. Markdown supported."
+                minRows={3}
               />
             </Field>
             {isLocal && !props.hidePromptTemplate && (
