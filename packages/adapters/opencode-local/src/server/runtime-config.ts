@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { asBoolean } from "@paperclipai/adapter-utils/server-utils";
+import type { AdapterRuntimeMcpServer } from "@paperclipai/adapter-utils";
 
 type PreparedOpenCodeRuntimeConfig = {
   env: Record<string, string>;
@@ -106,9 +107,15 @@ export async function prepareOpenCodeRuntimeConfig(input: {
   env: Record<string, string>;
   config: Record<string, unknown>;
   targetIsRemote?: boolean;
+  runtimeMcpServers?: AdapterRuntimeMcpServer[];
 }): Promise<PreparedOpenCodeRuntimeConfig> {
   const skipPermissions = asBoolean(input.config.dangerouslySkipPermissions, true);
-  if (!skipPermissions) {
+  // Run-scoped MCP delivery must not be suppressed by the permissions opt-out:
+  // only short-circuit when there are no assigned servers. With servers, the
+  // config is generated but the caller's permission block is preserved instead
+  // of blanket-allowed.
+  const hasRuntimeMcp = (input.runtimeMcpServers?.length ?? 0) > 0;
+  if (!skipPermissions && !hasRuntimeMcp) {
     return {
       env: input.env,
       notes: [],
@@ -131,10 +138,35 @@ export async function prepareOpenCodeRuntimeConfig(input: {
 
   const sourceConfigDir = path.join(resolveXdgConfigHome(input.env), "opencode");
   const runtimeConfigHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-config-"));
+  // mkdtemp already defaults to 0700, but chmod explicitly so privacy does not
+  // depend on the process umask.
+  await fs.chmod(runtimeConfigHome, 0o700);
   const runtimeConfigDir = path.join(runtimeConfigHome, "opencode");
   const runtimeConfigPath = path.join(runtimeConfigDir, "opencode.json");
 
-  await fs.mkdir(runtimeConfigDir, { recursive: true });
+  let notes: string[] = [];
+  try {
+    await generateRuntimeConfig();
+  } catch (err) {
+    // Any failure during config generation must not leave the (possibly
+    // token-bearing) temporary directory behind.
+    await fs.rm(runtimeConfigHome, { recursive: true, force: true });
+    throw err;
+  }
+
+  return {
+    env: {
+      ...input.env,
+      XDG_CONFIG_HOME: runtimeConfigHome,
+    },
+    notes,
+    cleanup: async () => {
+      await fs.rm(runtimeConfigHome, { recursive: true, force: true });
+    },
+  };
+
+  async function generateRuntimeConfig(): Promise<void> {
+  await fs.mkdir(runtimeConfigDir, { recursive: true, mode: 0o700 });
   try {
     await fs.cp(sourceConfigDir, runtimeConfigDir, {
       recursive: true,
@@ -149,8 +181,10 @@ export async function prepareOpenCodeRuntimeConfig(input: {
   }
 
   const existingConfig = await readJsonObject(runtimeConfigPath);
-  const notes = [
-    "Injected runtime OpenCode config with permission=allow for all tools and connections.",
+  notes = [
+    skipPermissions
+      ? "Injected runtime OpenCode config with permission=allow for all tools and connections."
+      : "Injected runtime OpenCode config with run-scoped MCP gateways; user permission configuration preserved.",
   ];
 
   // Merge gateway/custom provider definitions supplied via PAPERCLIP_OPENCODE_PROVIDERS
@@ -204,10 +238,40 @@ export async function prepareOpenCodeRuntimeConfig(input: {
 
   const nextConfig: Record<string, unknown> = {
     ...existingConfig,
-    permission: "allow",
   };
+  if (skipPermissions) {
+    // Default mode: blanket-allow. With the permissions opt-out, preserve the
+    // caller's existing permission configuration instead.
+    nextConfig.permission = "allow";
+  }
   if (Object.keys(nextProvider).length > 0) {
     nextConfig.provider = nextProvider;
+  }
+
+  // Merge run-scoped assigned Paperclip MCP gateways into OpenCode's `mcp` map.
+  // Existing user MCP entries are preserved unless an assigned server collides
+  // on name, in which case the assigned gateway wins for this run. Each entry
+  // uses OpenCode's remote schema with a Bearer header; tokens stay in the
+  // temp config file only (never in notes or logs).
+  if (hasRuntimeMcp && input.runtimeMcpServers) {
+    const existingMcp = isPlainObject(existingConfig.mcp)
+      ? { ...existingConfig.mcp }
+      : {};
+    const assignedNames: string[] = [];
+    for (const server of input.runtimeMcpServers) {
+      assignedNames.push(server.name);
+      existingMcp[server.name] = {
+        type: "remote",
+        url: server.url,
+        enabled: true,
+        oauth: false,
+        headers: { Authorization: `Bearer ${server.token}` },
+      };
+    }
+    nextConfig.mcp = existingMcp;
+    notes.push(
+      `Injected ${assignedNames.length} run-scoped Paperclip MCP gateway(s): ${assignedNames.join(", ")}.`,
+    );
   }
 
   // Pin OpenCode's auxiliary "small" model (used for session-title generation and
@@ -221,18 +285,14 @@ export async function prepareOpenCodeRuntimeConfig(input: {
     nextConfig.small_model = smallModel;
     notes.push(`Pinned OpenCode small_model to ${smallModel}.`);
   }
-  await fs.writeFile(runtimeConfigPath, `${JSON.stringify(nextConfig, null, 2)}\n`, "utf8");
-
-  return {
-    env: {
-      ...input.env,
-      XDG_CONFIG_HOME: runtimeConfigHome,
-    },
-    notes,
-    cleanup: async () => {
-      await fs.rm(runtimeConfigHome, { recursive: true, force: true });
-    },
-  };
+  await fs.writeFile(runtimeConfigPath, `${JSON.stringify(nextConfig, null, 2)}\n`, {
+    encoding: "utf8",
+    mode: 0o600,
+  });
+  // writeFile's mode only applies at creation; enforce it even if the file was
+  // copied from the user config home with wider permissions.
+  await fs.chmod(runtimeConfigPath, 0o600);
+  }
 }
 
 /** Managed credentials must never leave host-only homes in a remote process. */

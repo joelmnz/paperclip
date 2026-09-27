@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import type { AdapterRuntimeMcpServer } from "@paperclipai/adapter-utils";
 import { prepareOpenCodeRuntimeConfig } from "./runtime-config.js";
 
 const cleanupPaths = new Set<string>();
@@ -307,6 +308,94 @@ describe("prepareOpenCodeRuntimeConfig", () => {
     ) as Record<string, unknown>;
     expect(runtimeConfig.provider).toBeUndefined();
     await prepared.cleanup();
+  });
+
+  it("merges assigned run MCP servers, overriding same-name user entries and preserving unrelated entries", async () => {
+    const configHome = await makeConfigHome({
+      permission: "allow",
+      theme: "system",
+      mcp: {
+        "paperclip-assigned": { type: "local", command: ["echo", "stale-gateway"] },
+        "my-tools": { type: "local", command: ["my-tool-bin"] },
+      },
+    });
+    const assigned: AdapterRuntimeMcpServer = {
+      name: "paperclip-assigned",
+      url: "https://gateway.example.internal/mcp/run-123",
+      token: "tok-RED-SECRET",
+      connectionId: "conn-1",
+    };
+
+    const prepared = await prepareOpenCodeRuntimeConfig({
+      env: { XDG_CONFIG_HOME: configHome },
+      config: {},
+      runtimeMcpServers: [assigned],
+    });
+    cleanupPaths.add(prepared.env.XDG_CONFIG_HOME);
+
+    const runtimeConfig = JSON.parse(
+      await fs.readFile(
+        path.join(prepared.env.XDG_CONFIG_HOME, "opencode", "opencode.json"),
+        "utf8",
+      ),
+    ) as { permission?: unknown; mcp?: Record<string, Record<string, unknown>> };
+    // Unrelated user entry must survive untouched.
+    expect(runtimeConfig.mcp?.["my-tools"]).toEqual({ type: "local", command: ["my-tool-bin"] });
+    // Assigned entry overrides the stale same-name user entry with the remote schema.
+    expect(runtimeConfig.mcp?.["paperclip-assigned"]).toEqual({
+      type: "remote",
+      url: assigned.url,
+      enabled: true,
+      oauth: false,
+      headers: { Authorization: `Bearer ${assigned.token}` },
+    });
+    expect(runtimeConfig.permission).toBe("allow");
+    // No token may appear in notes.
+    expect(prepared.notes.every((note) => !note.includes(assigned.token))).toBe(true);
+
+    await prepared.cleanup();
+    cleanupPaths.delete(prepared.env.XDG_CONFIG_HOME);
+    await expect(fs.access(prepared.env.XDG_CONFIG_HOME)).rejects.toThrow();
+  });
+
+  it("retains existing permission config while delivering assigned MCP servers with permission opt-out", async () => {
+    const existingPermission = { read: "allow", bash: "ask" };
+    const configHome = await makeConfigHome({
+      permission: existingPermission,
+      mcp: { "my-tools": { type: "local", command: ["my-tool-bin"] } },
+    });
+    const assigned: AdapterRuntimeMcpServer = {
+      name: "paperclip-assigned",
+      url: "https://gateway.example.internal/mcp/run-456",
+      token: "tok-RED-SECRET-2",
+      connectionId: "conn-2",
+    };
+
+    const prepared = await prepareOpenCodeRuntimeConfig({
+      env: { XDG_CONFIG_HOME: configHome },
+      config: { dangerouslySkipPermissions: false },
+      runtimeMcpServers: [assigned],
+    });
+    cleanupPaths.add(prepared.env.XDG_CONFIG_HOME);
+
+    const runtimeConfig = JSON.parse(
+      await fs.readFile(
+        path.join(prepared.env.XDG_CONFIG_HOME, "opencode", "opencode.json"),
+        "utf8",
+      ),
+    ) as { permission?: unknown; mcp?: Record<string, Record<string, unknown>> };
+    // Existing permission is retained, not blanket-allowed.
+    expect(runtimeConfig.permission).toEqual(existingPermission);
+    // Run MCP is still delivered despite permissions-off.
+    expect(runtimeConfig.mcp?.["paperclip-assigned"]).toMatchObject({
+      type: "remote",
+      enabled: true,
+    });
+    expect(prepared.notes.every((note) => !note.includes(assigned.token))).toBe(true);
+
+    await prepared.cleanup();
+    cleanupPaths.delete(prepared.env.XDG_CONFIG_HOME);
+    await expect(fs.access(prepared.env.XDG_CONFIG_HOME)).rejects.toThrow();
   });
 
   it("respects explicit opt-out", async () => {
