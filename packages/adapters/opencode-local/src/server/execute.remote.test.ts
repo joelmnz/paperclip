@@ -335,6 +335,69 @@ describe("opencode remote execution", () => {
     expect(startAdapterExecutionTargetPaperclipBridge).not.toHaveBeenCalled();
   });
 
+  it("fails closed before config staging when run-scoped MCP gateways are assigned on a remote execution target", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-remote-mcp-"));
+    cleanupDirs.push(rootDir);
+    const workspaceDir = path.join(rootDir, "workspace");
+    await mkdir(workspaceDir, { recursive: true });
+
+    await expect(() =>
+      execute({
+        runId: "run-remote-mcp-fail-closed",
+        agent: {
+          id: "agent-1",
+          companyId: "company-1",
+          name: "OpenCode Builder",
+          adapterType: "opencode_local",
+          adapterConfig: {},
+        },
+        runtime: {
+          sessionId: null,
+          sessionParams: null,
+          sessionDisplayId: null,
+          taskKey: null,
+        },
+        config: {
+          command: "opencode",
+          model: "opencode/gpt-5-nano",
+        },
+        context: {
+          paperclipWorkspace: {
+            cwd: workspaceDir,
+            source: "project_primary",
+          },
+        },
+        executionTransport: {
+          remoteExecution: {
+            host: "127.0.0.1",
+            port: 2222,
+            username: "fixture",
+            remoteWorkspacePath: "/remote/workspace",
+            remoteCwd: "/remote/workspace",
+            privateKey: "PRIVATE KEY",
+            knownHosts: "[127.0.0.1]:2222 ssh-ed25519 AAAA",
+            strictHostKeyChecking: true,
+          },
+        },
+        runtimeMcp: {
+          getServers: () => [{
+            name: "paperclip-assigned",
+            url: "https://gateway.example.internal/mcp/run-remote",
+            token: "tok-REMOTE-SECRET",
+            connectionId: "conn-1",
+          }],
+        },
+        onLog: async () => {},
+      }),
+    ).rejects.toThrow(/remote execution target/);
+
+    // Fail-closed happens before config construction/staging: nothing is synced
+    // to the remote target and no token-bearing runtime config is created.
+    expect(syncDirectoryToSsh).not.toHaveBeenCalled();
+    expect(prepareWorkspaceForSshExecution).not.toHaveBeenCalled();
+    expect(startAdapterExecutionTargetPaperclipBridge).not.toHaveBeenCalled();
+  });
+
   it("resumes saved OpenCode sessions for remote SSH execution only when the identity matches", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-remote-resume-"));
     cleanupDirs.push(rootDir);

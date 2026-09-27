@@ -53,6 +53,39 @@ Worked examples:
   `credentials.json` from the sandbox image's own `$HOME/.claude`. The
   snapshot's Claude login is the credential source for the run.
 
+### Run-scoped MCP gateways vs connection-discovery tools
+
+Heartbeats deliver two different connection surfaces to adapters, and they are
+not interchangeable:
+
+- **Connection-discovery tools** (`ctx.runtimeTools`) expose
+  `connections_search` and `connection_request` so the agent can browse the
+  company's connection catalog and request access during a run. They never
+  carry assigned tool servers themselves.
+- **Run-scoped assigned MCP gateways** (`ctx.runtimeMcp`) carry the exact
+  gateway servers assigned to this run: a name, remote URL, short-lived bearer
+  token, and connection id per server. Adapters that consume them (the ACPX
+  engine used by `claude_local` and `codex_local`, and `opencode_local` on
+  local execution targets) inject them into a temporary per-run runtime
+  config — for OpenCode as `mcp.<name> = { type: 'remote', url, enabled:
+  true, oauth: false, headers: { Authorization: 'Bearer …' } }` — without
+  touching persistent agent configuration and without overriding unrelated
+  user MCP entries (same-name user entries are replaced for the run). The
+  token exists only in that temporary config (private file modes) and is
+  cleaned up when the run ends, including error paths.
+
+`opencode_local` **fails closed** when assigned MCP gateways are present on a
+remote execution target (SSH or managed sandbox): the token-bearing config
+would be staged into the target's persistent runtime directory where cleanup
+cannot be guaranteed, so the run is refused before any config is constructed.
+Use a local execution target for agents with assigned MCP tools.
+
+Reachability is a separate precondition in both cases: a connection that shows
+up in `connections_search` is not proof that its gateway URL is reachable from
+where the agent actually runs. Remote MCP gateways are reached directly over
+HTTP from the agent's host, so firewalls and loopback-only URLs will fail at
+tool-call time even when discovery succeeds.
+
 ### Hermes local vs gateway
 
 Use `hermes_local` when Paperclip should start the local `hermes` CLI on the

@@ -221,6 +221,112 @@ describe("OpenCode local skill injection", () => {
   });
 });
 
+describe("OpenCode run-scoped MCP handoff", () => {
+  let root: string;
+  let configHome: string;
+
+  beforeEach(async () => {
+    root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-mcp-handoff-"));
+    configHome = path.join(root, "config-home");
+    await fs.mkdir(path.join(configHome, "opencode"), { recursive: true });
+    await fs.writeFile(
+      path.join(configHome, "opencode", "opencode.json"),
+      JSON.stringify({
+        theme: "system",
+        mcp: { "my-tools": { type: "local", command: ["my-tool-bin"] } },
+      }),
+      "utf8",
+    );
+    vi.stubEnv("XDG_CONFIG_HOME", configHome);
+  });
+
+  afterEach(async () => {
+    vi.unstubAllEnvs();
+    await fs.rm(root, { recursive: true, force: true });
+  });
+
+  it("delivers ctx.runtimeMcp servers into the runtime config handed to the child process (local target)", async () => {
+    const workspace = path.join(root, "workspace");
+    const commandPath = path.join(root, "opencode");
+    await fs.mkdir(workspace, { recursive: true });
+    await fs.writeFile(commandPath, "#!/bin/sh\nexit 0\n", "utf8");
+    await fs.chmod(commandPath, 0o755);
+    const token = "mcp-run-token-SECRET";
+    const logs: string[] = [];
+    const metadata: unknown[] = [];
+    // Capture the config exactly when the child process would read it (during
+    // the run), because the adapter cleans the temp config home afterwards.
+    let capturedConfigHome = "";
+    let capturedConfig = "";
+    runProcessMock.mockReset();
+    runProcessMock.mockImplementation(async (
+      _runId: string,
+      _target: unknown,
+      _command: string,
+      args: string[],
+      options: { env: Record<string, string> },
+    ) => {
+      if (args.includes("run")) {
+        capturedConfigHome = options.env.XDG_CONFIG_HOME;
+        capturedConfig = await fs.readFile(
+          path.join(capturedConfigHome, "opencode", "opencode.json"),
+          "utf8",
+        );
+      }
+      return probeResult({
+        stdout: JSON.stringify({ type: "text", sessionID: "mcp-session", part: { text: "done" } }),
+      });
+    });
+
+    const result = await execute({
+      runId: "run-mcp-handoff",
+      agent: { id: "agent-1", companyId: "company-1", name: "OpenCode", adapterType: "opencode_local", adapterConfig: {} },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: {
+        command: commandPath,
+        cwd: workspace,
+        model: "openai/gpt-5",
+        env: { OPENCODE_ALLOW_ALL_MODELS: "1" },
+      },
+      context: {},
+      runtimeMcp: {
+        getServers: () => [{
+          name: "paperclip-assigned",
+          url: "https://gateway.example.internal/mcp/run-1",
+          token,
+          connectionId: "conn-1",
+        }],
+      },
+      onLog: async (_stream, chunk) => {
+        logs.push(chunk);
+      },
+      onMeta: async (value) => {
+        metadata.push(value);
+      },
+    });
+
+    expect(result.exitCode).toBe(0);
+    // The child process env points at the generated runtime config home, not the
+    // user's config home.
+    expect(capturedConfigHome).toBeTruthy();
+    expect(capturedConfigHome).not.toBe(configHome);
+    const runtimeConfig = JSON.parse(capturedConfig) as { mcp?: Record<string, Record<string, unknown>> };
+    expect(runtimeConfig.mcp?.["paperclip-assigned"]).toEqual({
+      type: "remote",
+      url: "https://gateway.example.internal/mcp/run-1",
+      enabled: true,
+      oauth: false,
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    // Unrelated user MCP entry preserved.
+    expect(runtimeConfig.mcp?.["my-tools"]).toEqual({ type: "local", command: ["my-tool-bin"] });
+    // No token in logs, metadata, or the result payload.
+    expect(JSON.stringify({ logs, metadata, result })).not.toContain(token);
+    // The token-bearing temp config home is cleaned up after the run.
+    await expect(fs.access(capturedConfigHome)).rejects.toThrow();
+  });
+});
+
 describe("ensureRemoteOpenCodeModelConfiguredAndAvailable", () => {
   afterEach(() => {
     delete process.env.OPENCODE_ALLOW_ALL_MODELS;
