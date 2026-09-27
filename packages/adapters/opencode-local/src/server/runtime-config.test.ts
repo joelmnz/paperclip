@@ -398,6 +398,61 @@ describe("prepareOpenCodeRuntimeConfig", () => {
     await expect(fs.access(prepared.env.XDG_CONFIG_HOME)).rejects.toThrow();
   });
 
+  it("does not follow an opencode.json symlink when writing the runtime config", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-test-"));
+    cleanupPaths.add(root);
+    const outsidePath = path.join(root, "outside-opencode.json");
+    const originalOutside = '{"keep":"me"}\n';
+    await fs.writeFile(outsidePath, originalOutside, "utf8");
+    const configHome = path.join(root, "config-home");
+    const configDir = path.join(configHome, "opencode");
+    await fs.mkdir(configDir, { recursive: true });
+    // Simulate a user config whose opencode.json is a symlink to a file outside
+    // the config home. Writing the run token through this symlink would clobber
+    // the outside file.
+    await fs.symlink(outsidePath, path.join(configDir, "opencode.json"), "file");
+    const assigned: AdapterRuntimeMcpServer = {
+      name: "paperclip-assigned",
+      url: "https://gateway.example.internal/mcp/run-789",
+      token: "tok-SYMLINK-SECRET",
+      connectionId: "conn-3",
+    };
+
+    const prepared = await prepareOpenCodeRuntimeConfig({
+      env: { XDG_CONFIG_HOME: configHome },
+      config: {},
+      runtimeMcpServers: [assigned],
+    });
+    cleanupPaths.add(prepared.env.XDG_CONFIG_HOME);
+
+    // The symlink target outside the runtime config home must be untouched.
+    await expect(fs.readFile(outsidePath, "utf8")).resolves.toBe(originalOutside);
+
+    // The generated runtime config must be a regular private file, not a symlink.
+    const runtimePath = path.join(prepared.env.XDG_CONFIG_HOME, "opencode", "opencode.json");
+    const stat = await fs.lstat(runtimePath);
+    expect(stat.isSymbolicLink()).toBe(false);
+    expect(stat.isFile()).toBe(true);
+    expect(stat.mode & 0o777).toBe(0o600);
+
+    const runtimeConfig = JSON.parse(await fs.readFile(runtimePath, "utf8")) as {
+      mcp?: Record<string, Record<string, unknown>>;
+    };
+    expect(runtimeConfig.mcp?.["paperclip-assigned"]).toEqual({
+      type: "remote",
+      url: assigned.url,
+      enabled: true,
+      oauth: false,
+      headers: { Authorization: `Bearer ${assigned.token}` },
+    });
+
+    await prepared.cleanup();
+    cleanupPaths.delete(prepared.env.XDG_CONFIG_HOME);
+    await expect(fs.access(prepared.env.XDG_CONFIG_HOME)).rejects.toThrow();
+    // Cleanup removes the temp config home without touching the outside file.
+    await expect(fs.readFile(outsidePath, "utf8")).resolves.toBe(originalOutside);
+  });
+
   it("respects explicit opt-out", async () => {
     const configHome = await makeConfigHome();
     const prepared = await prepareOpenCodeRuntimeConfig({

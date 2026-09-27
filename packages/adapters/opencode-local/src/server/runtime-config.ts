@@ -285,13 +285,25 @@ export async function prepareOpenCodeRuntimeConfig(input: {
     nextConfig.small_model = smallModel;
     notes.push(`Pinned OpenCode small_model to ${smallModel}.`);
   }
-  await fs.writeFile(runtimeConfigPath, `${JSON.stringify(nextConfig, null, 2)}\n`, {
+  // fs.cp(dereference:false) can copy an opencode.json SYMLINK from the user
+  // config home; fs.writeFile(runtimeConfigPath) would follow it and write the
+  // run token through to the outside target file. Instead, write a private
+  // tempfile in the runtime config dir and rename it over the target: rename(2)
+  // replaces the directory entry itself without following symlinks, so the
+  // token never escapes the temp config home and the runtime opencode.json is
+  // always a regular file.
+  // The runtime config dir itself needs no symlink check: it is created by
+  // mkdtemp/mkdir in this call and fs.cp only copies its contents, so it cannot
+  // be a pre-existing symlink.
+  const tempConfigPath = `${runtimeConfigPath}.${process.pid}.${Date.now()}.tmp`;
+  await fs.writeFile(tempConfigPath, `${JSON.stringify(nextConfig, null, 2)}\n`, {
     encoding: "utf8",
     mode: 0o600,
   });
-  // writeFile's mode only applies at creation; enforce it even if the file was
-  // copied from the user config home with wider permissions.
-  await fs.chmod(runtimeConfigPath, 0o600);
+  // writeFile's mode only applies at creation; enforce it even under an
+  // unusual umask before the rename publishes the file.
+  await fs.chmod(tempConfigPath, 0o600);
+  await fs.rename(tempConfigPath, runtimeConfigPath);
   }
 }
 
