@@ -327,7 +327,24 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   if (authToken) {
     env.PAPERCLIP_API_KEY = authToken;
   }
-  const preparedRuntimeConfig = await prepareOpenCodeRuntimeConfig({ env, config });
+  // Run-scoped assigned MCP gateways for this heartbeat run. `ctx.runtimeTools`
+  // continues to deliver connection-discovery tools (connections_search /
+  // connection_request) separately; this list is the per-run assigned gateway
+  // snapshot and is immutable for the run.
+  const runtimeMcpServers = ctx.runtimeMcp?.getServers() ?? [];
+  if (runtimeMcpServers.length > 0 && executionTargetIsRemote) {
+    // Fail closed: on remote targets the token-bearing runtime config is staged
+    // into the target's persistent runtime directory, and cleanup of that
+    // bearer-header file cannot be guaranteed across every failure path. Rather
+    // than leave a live credential on remote storage, refuse the run before any
+    // config is constructed or staged. Local execution targets (including
+    // single-node K3s pods running the adapter in-process) clean the config via
+    // the prepared-runtime-config `finally` below.
+    throw new Error(
+      "Run-scoped MCP gateways cannot be delivered to remote execution targets: the token-bearing runtime config cannot be guaranteed cleaned from persistent remote storage. Run this agent on a local execution target to use assigned MCP tools.",
+    );
+  }
+  const preparedRuntimeConfig = await prepareOpenCodeRuntimeConfig({ env, config, runtimeMcpServers });
   const localRuntimeConfigHome =
     preparedRuntimeConfig.notes.length > 0 ? preparedRuntimeConfig.env.XDG_CONFIG_HOME : "";
   try {
